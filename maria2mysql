@@ -1,0 +1,122 @@
+#!/usr/bin/perl
+#
+# maria2mysql - a utility to correct some basic issues
+# when migrating a database from MariaDB to MySQL 8
+#
+# Author: Ryan Henry <rhenry@a2hosting.com>
+#
+
+use strict;
+
+if ($#ARGV != 1)
+{
+	print "Converts MariaDB database dumps to be imported into MySQL 8 servers\n";
+	print "Usage: $0 input.sql output.sql\n";
+	exit;
+}
+
+open(INFILE, "<", $ARGV[0]) or die $!;
+open(OUTFILE, ">", $ARGV[1]) or die $!;
+
+# First thing we do is put "SET innodb_strict_mode=0;" at the top of the file,
+# to fix the "Row size too large (> 8126)" errors
+print OUTFILE "SET innodb_strict_mode=0;  -- ADDED BY MARIA2MYSQL\n\n";
+
+while (my $line = <INFILE>) {
+	# look for a line that sets the sql_mode
+	if ($line =~ m/50003 SET sql_mode/) {
+		# found it, now remove "NO_AUTO_CREATE_USER" if it exists
+		$line =~ s/NO_AUTO_CREATE_USER//;
+		# remove a double-comma that may have been left behind if
+		# that was in the middle of a string, like
+		# ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+		$line =~ s/,,/,/;
+		# if NO_AUTO_CREATE_USER was at the start of the line, there may be a comma at the start
+		# that needs to be removed
+		$line =~ s/',/'/;
+		# if NO_AUTO_CREATE_USER was the only thing in the sql_mode setting, 
+		# and leaves behind just single-quotes, don't bother outputting anything:
+		if ($line !~ m/''/) {
+			# no double-single-quotes, output the line:
+			chomp $line;
+			print OUTFILE $line . " -- MODIFIED BY MARIA2MYSQL\n";
+		} else {
+			print OUTFILE "-- REMOVED EMPTY sql_mode SETTING - MARIA2MYSQL\n";
+		}
+		# grab the next line for the rest of the logic to handle
+		$line = <INFILE>;
+	}
+		
+	# we're only interested in CREATE TABLE statements - we don't want to change any actual data
+	if ($line =~ /^create table/i) {
+		print OUTFILE $line;	# just output the CREATE TABLE line, no changes needed
+		while ($line = <INFILE>) {
+			# change "ROW_FORMAT=FIXED" to "ROW_FORMAT=COMPACT"
+			$line =~ s/ROW_FORMAT=FIXED/ROW_FORMAT=COMPACT/ig;
+			if ($line =~ /;\s*$/) { 
+				# the line ends with a semi-colon, so just output it, not sure if
+				# we really need to check, but in theory it could span multiple lines
+				print OUTFILE $line;
+				last; 
+			}			
+			if ($line =~ /(`|'|")\w+(`|'|")\s+(text|longtext|blob|geometry|json)[\w\s]+DEFAULT/ig) {
+				# convert default value format for text/blob/geometry/json types. Changes:
+				# text NULL DEFAULT 'Pending'
+				# to
+				# text NULL DEFAULT ('Pending')
+				print "Found text/blob/geometry/json field with default value:$'";
+				my $newstring = $&;
+				my $text = $';
+				chomp($text);
+				my $comma = '';
+				if (substr($text, -1) eq ',') {
+					$comma = ',';
+					chop($text);
+				}					
+				$text =~ s/,\s*$//;
+				$text =~ s/^\s+//;
+				$text =~ s/COMMENT[\w\s].*//i;
+				$newstring = $newstring . " (" . $text . ")" . $comma . "\n";
+				print "Replacing with: $newstring\n";
+				chomp($newstring);
+				print OUTFILE $newstring . " -- MODIFIED BY MARIA2MYSQL\n";
+			} elsif ($line =~ /(`|'|")\w+(`|'|")\s+date\ [\w\s]+current_timestamp/ig) {
+				# change date default from current_timestamp to CURRENT_DATE
+				print "Found date field with current_timestamp()\n";
+				my $newstring = $&;
+				my $text = $';
+				chomp($text);
+				my $comma = '';
+				if (substr($text, -1) eq ',') {
+					$comma = ','
+				}					
+				$newstring =~ s/current_timestamp/\(CURRENT_DATE\)/;
+				print "Replacing with: " . $newstring . "\n";
+				chomp($newstring);
+				print OUTFILE $newstring . " " . $comma . "  -- MODIFIED BY MARIA2MYSQL\n";
+			} elsif ($line =~ /(`|'|")\w+(`|'|")\s+time\ [\w\s]+current_timestamp/ig) {
+				# change time field to use CURRENT_TIME instead of current_timestamp
+				print "Found time field with current_timestamp()\n";
+				my $newstring = $&;
+				my $text = $';
+				chomp($text);
+				my $comma = '';
+				if (substr($text, -1) eq ',') {
+					$comma = ','
+				}					
+				$newstring =~ s/current_timestamp/\(CURRENT_TIME\)/;
+				print "Replacing with: " . $newstring . "\n";
+				chomp($newstring);
+				print OUTFILE $newstring . " " . $comma . " -- MODIFIED BY MARIA2MYSQL\n";
+			} else {
+				print OUTFILE $line;
+			}
+		}
+	} else {
+		# not part of a CREATE TABLE statement, just output it
+		print OUTFILE $line;
+	}
+}
+
+close(INFILE);
+close(OUTFILE);

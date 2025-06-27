@@ -1,0 +1,48 @@
+#!/bin/bash
+
+if [[ $# != 1 ]]; then
+	echo "Usage: $0 domain.com"
+	echo "Adds a DMARC record to the domain if there isn't already one."
+	exit;
+fi
+
+domain=$1
+
+# Get owner of domain:
+owner=$(whmapi1 --output=jsonpretty domainuserdata domain="$domain" | jq -r '.data.userdata.user')
+if [ $owner == "null" ]; then
+	echo "Could not find owner of $domain - does domain exist?"
+	exit;
+fi
+
+# Check for existing dmarc record:
+if grep '^_dmarc' /var/named/$domain.db; then
+	echo "Existing dmarc record found. Exiting."
+	exit;
+fi
+
+# Get contact email:
+email=$(uapi --output=jsonpretty --user=$owner Variables get_user_information name=contact_email | jq -r '.result.data.contact_email')
+regex="^(([-a-zA-Z0-9\!#\$%\&\'*+/=?^_\`{\|}~]+|(\"([][,:;<>\&@a-zA-Z0-9\!#\$%\&\'*+/=?^_\`{\|}~-]|(\\\\[\\ \"]))+\"))\.)*([-a-zA-Z0-9\!#\$%\&\'*+/=?^_\`{\|}~]+|(\"([][,:;<>\&@a-zA-Z0-9\!#\$%\&\'*+/=?^_\`{\|}~-]|(\\\\[\\ \"]))+\"))@\w((-|\w)*\w)*\.(\w((-|\w)*\w)*\.)*\w{2,4}$"
+if ! [[ $email =~ $regex ]]; then
+	echo "No contact email found. Exiting."
+	exit;
+fi
+record="v=DMARC1; p=none; rua=mailto:dmarc-monitor@$domain"
+
+echo "A dmarc record for $domain will be added: $record"
+read -p "Proceed (y/n)? " yn
+case $yn in
+	[yY]* )
+		# Create forwarder:
+		output=$(uapi --output=jsonpretty --user=$owner Email add_forwarder domain="$domain" email="dmarc-monitor@$domain" fwdopt='fwd' fwdemail="$email")
+		echo "Created forwarder for dmarc-monitor@domain => $email"
+
+		# Add DNS record:
+		output=$(whmapi1 addzonerecord domain=$domain name=_dmarc class=IN ttl=86400 type=TXT txtdata="$record")
+		echo "Created dmarc record:"	
+		grep '_dmarc' /var/named/$domain.db
+		;;
+	* )
+		echo "exiting without creating record"
+esac

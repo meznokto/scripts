@@ -1,0 +1,242 @@
+#!/bin/bash
+# A2wp script v0.0
+
+Red=$'\e[1;31m';
+Green=$'\e[1;32m';
+Clear=$'\e[0m';
+
+# print usage instructions
+usage() {
+cat << EOF
+Usage: $0 [options] /path/to/wordpress
+
+-h   |   --help   Display this help
+
+-i   |   --info   Display basic info about the Wordpress installation
+
+-p   |   --plugins   List installed plugins
+
+-d <plugin>   |   --deactivate <plugin>   Deactivate a plugin
+
+-a <plugin>   |   --activate <plugin>   Activate a plugin
+
+-g   |   --pagespeed   Runs a google pagespeed test on the website
+
+--all   Run all checks/tests
+EOF
+}
+
+# make sure we're running as root
+if [ "$EUID" -ne 0 ]
+  then echo "You need to run this via sudo, you are currently running it as $me"
+  exit
+fi
+
+# global variables
+user=''
+path=''
+ip=''
+oldshell=''
+siteurl=''
+version=''
+
+function verify() {
+  # find the owner of the path provided
+  user=$(stat -c "%U" $path)
+  #echo "User: $user"
+  
+  # get IP address of cPanel account
+  ip=$(whmapi1 listaccts search=$user searchtype=user want=ip --output=json | jq -r '.data.acct[] | .ip')
+
+  # check that it looks like an IP
+  if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # valid enough IP
+    #echo "$Green IP Address $ip $Clear"
+    echo;
+  else
+    # not an IP, non-cPanel user?
+    echo "$Red Invalid IP found, is this a real cPanel user? $Clear"
+    exit;
+  fi
+  
+  # get user's current shell
+  oldshell=$(whmapi1 --output=json accountsummary user=$user | jq -r '.data.acct[]|.shell')
+  #echo "Current shell: $oldshell"
+  
+  if [[ $oldshell != *bash ]]; then
+    # set normal shell
+    echo "Changing to bash shell"
+    whmapi1 modifyacct user=$user HASSHELL=1 shell=/bin/bash > /dev/null
+  fi
+  
+  siteurl=$(/bin/su - $user -c "/usr/local/bin/php /bin/wp --path=$path option get siteurl | head -n1")
+  if [[ $siteurl == Error* ]]; then
+    echo "Does not appear to be a wordpress site. Exiting..."
+    exit;
+  fi
+  #echo "$Green siteurl: $siteurl $Clear"
+  version=$(/bin/su - $user -c "/usr/local/bin/php /bin/wp --path=$path core version | head -n1")
+  #echo "$Green WP Version: $version $Clear"
+}
+
+function resetShell() {
+  # replace old shell setting
+  if [[ $oldshell == *noshell ]]; then
+    echo "Disabling shell"
+    whmapi1 modifyacct user=$user HASSHELL=0 > /dev/null
+  else
+    if [[ $oldshell != *bash ]]; then
+      # not bash shell, so setting to previous shell
+      echo "Resetting shell"
+      whmapi1 modifyacct user=$user HASSHELL=1 shell=$oldshell > /dev/null 
+    fi
+  fi
+}
+
+function getInfo() {
+  echo "$Green URL: $siteurl $Clear"
+  echo "$Green WP Version: $version $Clear"
+}
+
+function plugins() {
+  # get info about installed plugins
+# echo "Getting plugin information"
+  pluginlist=$(/bin/su - $user -c "/usr/local/bin/php /bin/wp --path=$path --format=json plugin list 2>&1")
+  echo "Plugins (green = active):"
+  jq -c '.[]' <<< $pluginlist | while read i; do
+       plugin_name=$(jq -r '.name' <<< $i)
+       plugin_version=$(jq -r '.version' <<< $i)
+       plugin_update=$(jq -r '.update' <<< $i)
+       plugin_status=$(jq -r '.status' <<< $i)
+       
+    if [[ $plugin_update != "none" ]]; then
+      plugin_update="$Red Update Available! $Clear"
+    else
+      plugin_update=""
+    fi
+    
+    if [[ $plugin_status != "active" ]]; then
+      echo "$Clear $plugin_name $plugin_version $plugin_update"
+    else
+      echo "$Green $plugin_name $plugin_version $plugin_update"
+    fi
+  done
+}
+
+function deactivatePlugin() {
+  # deactivates a plugin
+  result=$(/bin/su - $user -c "/usr/local/bin/php /bin/wp --path=$path plugin deactivate $1 2>&1")
+  echo $result
+}
+
+function activatePlugin() {
+  # activate a plugin
+  result=$(/bin/su - $user -c "/usr/local/bin/php /bin/wp --path=$path plugin activate $1 2>&1")
+  echo $result
+}
+
+function checkLitespeed() {
+  # check if website is service from litespeed and if litespeed-cache is being used
+  domain=$(echo $siteurl | sed -E 's/^\s*.*:\/\///g')
+  server=$(curl -I --resolve $domain:443:$ip --resolve $domain:80:$ip $siteurl 2>/dev/null | grep -i "server")
+  
+  if grep -qi "litespeed" <<< $server; then
+    echo "$Green Running on Litespeed $Clear"
+    cache=$(curl -sS -D - $siteurl -o/dev/null | grep -i "x-litespeed-cache")
+    if [[ ! $cache ]]; then
+      echo "$Red Not using litespeed-cache $Clear"
+    else
+      echo "$Green Using litespeed-cache $Clear"
+    fi
+  else
+    echo "$Red Not running on Litespeed $Clear"
+  fi
+}
+
+function checkCDN() {
+  # check if site is using a CDN
+  # can check for 'Server: cloudflare' header, have to find how
+  # quic.cloud, sucuri, etc do it.
+  server=$(curl -sS -D - $siteurl -o/dev/null | grep -i "server")
+  if grep -qi "cloudflare" <<< $server; then
+    echo "$Green Using Cloudflare CDN $Clear"
+  elif grep -qi "x-qc-pop" <<< $server; then
+    echo "$Green Using Quic.Cloud CDN $Clear"
+  elif grep -qi "x-sucuri-cache" <<< $server; then
+    echo "$Green Using Sucuri CDN $Clear"
+  elif grep -qi "imunify360-webshield" <<< $server; then
+    echo "$Red Request blocked by Imunify360! $Clear"
+  else
+    echo "$Red Not using a CDN $Clear"
+  fi
+}
+
+function checkGZIP() {
+  # check if website uses gzip compression
+  gzip=$(curl -I -H 'Accept-Encoding: gzip,deflate'  $siteurl 2>/dev/null | grep -i "content-encoding: gzip")
+  if [[ ! $gzip ]]; then
+    echo "$red Site does not support gzip compression $Clear"
+  else
+    echo "$Green Site suports gzip compression $Clear"
+  fi
+}
+
+function googlePageSpeed() {
+  # query google pagespeed insights api
+  echo "Querying pagespeed api for desktop results..."
+  pagespeedDesktop=$(curl -s "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=$siteurl&strategy=desktop")
+  echo "Querying pagespeed api for mobile results..."
+  pagespeedMobile=$(curl -s "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=$siteurl&strategy=mobile")
+  
+  desktopScore=$(jq '.lighthouseResult.categories.performance.score' <<< $pagespeedDesktop)
+  mobileScore=$(jq '.lighthouseResult.categories.performance.score' <<< $pagespeedMobile)
+
+  lcpDesktop=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.largestContentfulPaint' <<< $pagespeedDesktop)
+  lcpMobile=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.largestContentfulPaint' <<< $pagespeedMobile)
+
+  fcpDesktop=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.firstContentfulPaint' <<< $pagespeedDesktop)
+  fcpMobile=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.firstContentfulPaint' <<< $pagespeedMobile)
+  
+  tbtDesktop=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.totalBlockingTime' <<< $pagespeedDesktop)
+  tbtMobile=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.totalBlockingTime' <<< $pagespeedMobile)
+  
+  clsDesktop=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.cumulativeLayoutShift' <<< $pagespeedDesktop)
+  clsMobile=$(jq '.lighthouseResult.audits.metrics.details.items[0]|.cumulativeLayoutShift' <<< $pagespeedMobile)
+  
+  speedDesktop=$( jq '.lighthouseResult.audits.metrics.details.items[0]|.speedIndex' <<< $pagespeedDesktop)
+  speedMobile=$( jq '.lighthouseResult.audits.metrics.details.items[0]|.speedIndex' <<< $pagespeedMobile)
+  
+  printf "$Green \t\t\t\t Desktop \t Mobile \n$Clear"
+  printf "$Green Pagespeed score:\t\t %s \t\t %s $Clear\n" $desktopScore $mobileScore
+  printf "$Green Largest Contentful Paint: \t %s \t\t %s $Clear\n" $lcpDesktop $lcpMobile
+  printf "$Green First Contentful Paint: \t %s \t\t %s $Clear\n" $fcpDesktop $fcpMobile
+  printf "$Green Total Blocking Time: \t\t %s \t\t %s $Clear\n" $tbtDesktop $tbtMobile
+  #printf "$Green Cumulative Layout Shift: %s \t\t\t %s $Clear\n" $clsDesktop $clsMobile
+  printf "$Green Speed Index: \t\t\t %s \t\t %s $Clear\n" $speedDesktop $speedMobile
+}
+
+# process command line options
+TEMP=$(getopt -o i:p:d:g:s:h --long info:,plugins:,deactivate:,activate:,pagespeed:,optimizations:,all:,help -n 'a2wp' -- "$@")
+
+if [ $? != 0 ] ; then echo "Terminating..." >&2 ; exit 1 ; fi
+
+# Note the quotes around '$TEMP': they are essential!
+eval set -- "$TEMP"
+
+case "$1" in
+  -i | --info ) path="$2"; verify ; getInfo ; resetShell ;;
+  -p | --plugins ) path="$2"; verify ; plugins ; resetShell ;;
+  -d | --deactivate ) path="$4"; verify ; deactivatePlugin "$2" ; resetShell ;;
+  -a | --activate ) path="$4"; verify; activatePlugin "$2" ; resetShell ;;
+  -g | --pagespeed ) path="$2" ; verify ; googlePageSpeed ; resetShell ;;
+  -s | --optimizations ) path="$2" ; verify ; checkLitespeed; checkCDN; checkGZIP ; resetShell ;;
+  --all ) path="$2" ; verify ; 
+    echo "Basic Info" ; getInfo ; echo "" ;
+    plugins ; echo "" ;
+    echo "Server Checks" ; checkLitespeed ; checkCDN ; checkGZIP ; echo "" ;
+    echo "Google Pagespeed" ; googlePageSpeed ; echo "" ;
+    resetShell ;;
+  * ) usage ;;
+esac
+
+

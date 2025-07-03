@@ -1,0 +1,75 @@
+#!/bin/bash
+
+_DEBUG="off"
+function DEBUG() {
+  [ "$_DEBUG" == "on" ] && echo "debug: $@"
+}
+
+function usage() {
+    cat << EOF
+Usage: $0 username domain
+Creates a temporary email account and sends a test mesage
+to mail-tester.com via SMTP and provides a link to the results.
+EOF
+}
+
+# Set colors
+red="\\033[1;31m"
+cyan="\\033[1;36m"
+white="\\033[1;37m"
+yellow="\\033[1;33m"
+magenta="\\033[1;35m"
+green="\\033[1;32m"
+normal="\\033[0m"
+
+if [ $# -ne 2 ]; then
+    usage
+    exit 1
+fi
+
+user=${1}
+domain=${2}
+password=$(tr -dc 'A-Za-z0-9!?%=' < /dev/urandom | head -c 12)
+
+DEBUG "User: ${user}"
+DEBUG "Domain: ${domain}"
+DEBUG "Password: ${password}"
+
+# generate a random email address to send to
+email=$(/opt/alt/alt-nodejs20/root/usr/bin/node -e "process.stdout.write('test-'+(Math.random().toString(36).substring(2,11))+'@srv1.mail-tester.com');")
+
+firstpart=$(echo ${email} | cut -d'@' -f1)
+
+echo -en "${yellow}Creating email account ${firstpart}@${domain}...${normal}"
+result=$(uapi --output=jsonpretty --user=${user} Email add_pop email="${firstpart}@${domain}" password="${password}")
+DEBUG ${result}
+success=$(echo ${result} | jq -r .result.status)
+
+if [ ${success} -ne 1 ]; then
+    error=$(echo ${result} | jq -r .result.errors)
+    echo -en "${red}Error creating email account: $error${noraml}\n"
+    exit 1
+fi
+
+echo -en "${green}Done.${normal}\n"
+
+echo -en "${yellow}Sending email to ${email}...${normal}"
+DEBUG "echo \"Checking email sending results.\" | mailx -s \"Test email\" -S smtp=smtp://localhost -S smtp-auth=login -S smtp-auth-user=\"${firstpart}@${domain}\" -S smtp-auth-password=\"${password}\" -S from=\"A2 Support <${firstpart}@${domain}>\" ${firstpart}@srv1.mail-tester.com"
+result=$(echo "Checking email sending results." | mailx -s "Test email" -S smtp=smtp://localhost -S smtp-auth=login -S smtp-auth-user="${firstpart}@${domain}" -S smtp-auth-password="${password}" -S from="A2 Support <${firstpart}@${domain}>" ${firstpart}@srv1.mail-tester.com)
+
+echo -en "${green}Done.${normal}\n"
+
+echo -en "${yellow}Removing email account...${normal}"
+result=$(uapi --output=jsonpretty --user=${user} Email delete_pop email="${firstpart}@${domain}")
+DEBUG ${result}
+success=$(echo ${result} | jq -r .result.status)
+
+if [ ${success} -ne 1 ]; then
+    error=$(echo ${result} | jq -r .result.errors)
+    echo -en "${red}Error removing email account: $error${normal}\n"
+fi
+
+echo -en "${green}Done.${normal}\n"
+
+echo -en "${green}Test comlete. Go to ${magenta}https://www.mail-tester.com/${firstpart}${green} to see results.${normal}\n"
+
